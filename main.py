@@ -12,6 +12,7 @@ from cryptography.hazmat.primitives.serialization import load_pem_public_key
 import subprocess
 import sys
 import shutil
+import click
 
 app = typer.Typer(help="Behold! The mighty deploy-gen! Let me generate deploy yaml files for you!")
 
@@ -240,15 +241,37 @@ def encrypt_secret(public_key_str: str, secret_value: str) -> str:
     Returns:
         The encrypted value as a base64 encoded string
     """
-    # Convert the base64 encoded public key to PEM format
+    # Decode the base64 encoded public key
     public_key_bytes = base64.b64decode(public_key_str)
-    public_key_pem = b"-----BEGIN PUBLIC KEY-----\n"
-    public_key_pem += b"\n".join(base64.b64encode(public_key_bytes[i:i+32]) for i in range(0, len(public_key_bytes), 32))
-    public_key_pem += b"\n-----END PUBLIC KEY-----"
     
-    # Load the public key
-    public_key = load_pem_public_key(public_key_pem)
+    # Load the public key directly
+    try:
+        public_key = load_pem_public_key(public_key_bytes)
+    except Exception as e:
+        # If direct loading fails, try converting to PEM format
+        try:
+            # Convert to PEM format
+            public_key_pem = b"-----BEGIN PUBLIC KEY-----\n"
+            public_key_pem += base64.b64encode(public_key_bytes)
+            public_key_pem += b"\n-----END PUBLIC KEY-----"
+            
+            # Load the public key
+            public_key = load_pem_public_key(public_key_pem)
+        except Exception as nested_e:
+            # If both methods fail, use the libsodium approach which GitHub uses
+            from nacl import encoding, public
+            
+            # Create a public key object from the base64 encoded string
+            public_key = public.PublicKey(public_key_bytes, encoding.RawEncoder)
+            
+            # Encrypt using libsodium
+            sealed_box = public.SealedBox(public_key)
+            encrypted = sealed_box.encrypt(secret_value.encode("utf-8"))
+            
+            # Return the encrypted value as a base64 encoded string
+            return base64.b64encode(encrypted).decode("utf-8")
     
+    # If we got here, we successfully loaded the key using cryptography
     # Encrypt the secret value
     encrypted = public_key.encrypt(
         secret_value.encode("utf-8"),
@@ -371,21 +394,43 @@ def create_repo_value(
             "encrypted_value": encrypted_value,
             "key_id": key_id
         }
+        
+        # Create or update the secret
+        response = requests.put(value_url, headers=headers, json=data)
     else:
         # For variables
-        if environment:
-            value_url = f"https://api.github.com/repositories/{get_repo_id(owner, repo_name, token)}/environments/{environment}/variables/{name}"
-        else:
-            value_url = f"https://api.github.com/repos/{owner}/{repo_name}/actions/variables/{name}"
-            
         # Prepare data for API
         data = {
             "name": name,
             "value": value
         }
-    
-    # Create or update the secret/variable
-    response = requests.put(value_url, headers=headers, json=data)
+        
+        if environment:
+            # For environment variables
+            variables_url = f"https://api.github.com/repositories/{get_repo_id(owner, repo_name, token)}/environments/{environment}/variables"
+        else:
+            # For repository variables
+            variables_url = f"https://api.github.com/repos/{owner}/{repo_name}/actions/variables"
+        
+        # First check if the variable already exists
+        try:
+            existing_variables = []
+            list_response = requests.get(variables_url, headers=headers)
+            
+            if list_response.status_code == 200:
+                existing_variables = [v["name"] for v in list_response.json().get("variables", [])]
+            
+            # If variable exists, update it
+            if name in existing_variables:
+                value_url = f"{variables_url}/{name}"
+                response = requests.patch(value_url, headers=headers, json={"value": value})
+            else:
+                # If variable doesn't exist, create it
+                response = requests.post(variables_url, headers=headers, json=data)
+        except Exception as e:
+            typer.echo(f"Error checking for existing variable: {e}")
+            # Fallback to POST request
+            response = requests.post(variables_url, headers=headers, json=data)
     
     if response.status_code not in (201, 204):
         typer.echo(f"Error: Failed to create {value_type.value} (Status code: {response.status_code})")
@@ -1346,10 +1391,228 @@ def run_repomix(
         raise typer.Abort()
 
 
+@app.command()
+def interactive_deploy():
+    """
+    Interactive mode to guide you through generating deployment files.
+    
+    This command will walk you through the process of generating deployment files
+    for your application by asking a series of questions and using your answers
+    to create the appropriate configuration.
+    """
+    typer.echo(typer.style("Welcome to the Interactive Deployment Generator!", fg=typer.colors.BRIGHT_GREEN, bold=True))
+    typer.echo("This tool will help you create deployment files for your application.")
+    typer.echo("Let's get started!\n")
+    
+    # Step 1: Choose deployment type
+    typer.echo(typer.style("Step 1: Choose Deployment Type", fg=typer.colors.BRIGHT_BLUE, bold=True))
+    deploy_type = typer.prompt(
+        "What type of deployment do you want to generate?",
+        type=click.Choice(["backend", "frontend", "both"]),
+        default="backend"
+    )
+    
+    # Step 2: Repository information
+    typer.echo("\n" + typer.style("Step 2: Repository Information", fg=typer.colors.BRIGHT_BLUE, bold=True))
+    repo = typer.prompt("Enter your repository name in format 'owner/repo'")
+    
+    # Step 3: Project information
+    typer.echo("\n" + typer.style("Step 3: Project Information", fg=typer.colors.BRIGHT_BLUE, bold=True))
+    project_id = typer.prompt("Enter your Google Cloud project ID")
+    
+    # Step 4: Analyze codebase (skip for frontend-only deployments)
+    repomix_file = None
+    if deploy_type != "frontend":
+        typer.echo("\n" + typer.style("Step 4: Codebase Analysis", fg=typer.colors.BRIGHT_BLUE, bold=True))
+        analyze_codebase = typer.confirm("Would you like to analyze your codebase for environment variables?", default=True)
+        
+        if analyze_codebase:
+            # Check if repomix is installed
+            if not check_repomix_installed():
+                typer.echo("Repomix is required for codebase analysis but not installed.")
+                install_repomix = typer.confirm("Would you like to install it now?", default=True)
+                if install_repomix:
+                    try:
+                        typer.echo("Installing repomix globally...")
+                        subprocess.check_call(["npm", "install", "-g", "repomix"])
+                        typer.echo("Repomix installed successfully!")
+                    except subprocess.CalledProcessError as e:
+                        typer.echo(f"Failed to install repomix: {e}")
+                        typer.echo("Please install it manually with 'npm install -g repomix'.")
+                        analyze_codebase = False
+                else:
+                    analyze_codebase = False
+            
+            if analyze_codebase:
+                target_folder = typer.prompt("Enter the path to your codebase", default=".")
+                target_path = os.path.abspath(target_folder)
+                
+                if not os.path.isdir(target_path):
+                    typer.echo(f"Error: Target folder '{target_folder}' does not exist or is not a directory.")
+                    analyze_codebase = False
+                else:
+                    output_file = "repomix-output.txt"
+                    typer.echo(f"Running repomix against {target_path}...")
+                    
+                    try:
+                        # Execute the command
+                        cmd = ["npx", "repomix", target_path, "-o", output_file]
+                        process = subprocess.Popen(
+                            cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                            universal_newlines=True
+                        )
+                        
+                        # Stream the output in real-time
+                        for line in iter(process.stdout.readline, ""):
+                            if not line:
+                                break
+                            typer.echo(line.strip())
+                        
+                        # Get the return code
+                        return_code = process.wait()
+                        
+                        # Collect stderr
+                        stderr_lines = []
+                        for line in iter(process.stderr.readline, ""):
+                            if not line:
+                                break
+                            stderr_lines.append(line.strip())
+                        
+                        # Check for errors
+                        if return_code != 0:
+                            typer.echo(f"Error executing repomix command (exit code {return_code}):")
+                            for line in stderr_lines:
+                                typer.echo(line)
+                            analyze_codebase = False
+                        else:
+                            typer.echo(f"Repomix completed successfully. Output saved to {output_file}")
+                            repomix_file = output_file
+                            
+                    except Exception as e:
+                        typer.echo(f"An unexpected error occurred: {e}")
+                        analyze_codebase = False
+    else:
+        # For frontend deployments, skip the codebase analysis step
+        typer.echo("\n" + typer.style("Step 4: Codebase Analysis", fg=typer.colors.BRIGHT_BLUE, bold=True))
+        typer.echo("Skipping codebase analysis for frontend deployment.")
+    
+    # Step 5: Deployment configuration
+    typer.echo("\n" + typer.style("Step 5: Deployment Configuration", fg=typer.colors.BRIGHT_BLUE, bold=True))
+    
+    # Common configuration
+    region = typer.prompt("Enter your Google Cloud region", default="asia-southeast1")
+    branches = typer.prompt("Enter comma-separated list of branches to deploy from", default="main,dev")
+    
+    # Backend specific configuration
+    backend_config = {}
+    if deploy_type in ["backend", "both"]:
+        typer.echo("\n" + typer.style("Backend Configuration:", fg=typer.colors.BRIGHT_CYAN))
+        backend_config["service_name"] = typer.prompt("Enter your Cloud Run service name", default="backend")
+        backend_config["backend_dir"] = typer.prompt("Enter the path to your backend directory", default="./")
+        backend_config["python_version"] = typer.prompt("Enter the Python version to use", default="3.12")
+        backend_config["output_file"] = typer.prompt("Enter the output file for backend deployment", default=".github/workflows/deploy-backend.yml")
+    
+    # Frontend specific configuration
+    frontend_config = {}
+    if deploy_type in ["frontend", "both"]:
+        typer.echo("\n" + typer.style("Frontend Configuration:", fg=typer.colors.BRIGHT_CYAN))
+        frontend_config["frontend_dir"] = typer.prompt("Enter the path to your frontend directory", default="./frontend")
+        frontend_config["node_version"] = typer.prompt("Enter the Node.js version to use", default="18")
+        frontend_config["output_file"] = typer.prompt("Enter the output file for frontend deployment", default=".github/workflows/deploy-frontend.yml")
+    
+    # Step 6: GitHub authentication
+    typer.echo("\n" + typer.style("Step 6: GitHub Authentication", fg=typer.colors.BRIGHT_BLUE, bold=True))
+    check_secrets = typer.confirm("Would you like to check if required secrets exist in your GitHub repository?", default=True)
+    
+    if check_secrets:
+        # Check if GitHub token is already configured
+        if not GITHUB_TOKEN_FILE.exists():
+            typer.echo("GitHub token not found. You need to authenticate with GitHub.")
+            auth_now = typer.confirm("Would you like to authenticate with GitHub now?", default=True)
+            if auth_now:
+                token = typer.prompt("Enter your GitHub Personal Access Token", hide_input=True)
+                try:
+                    github_auth(token=token, force=True, verify=True)
+                except typer.Abort:
+                    typer.echo("GitHub authentication failed. Continuing without checking secrets.")
+                    check_secrets = False
+            else:
+                check_secrets = False
+    
+    # Step 7: Generate deployment files
+    typer.echo("\n" + typer.style("Step 7: Generating Deployment Files", fg=typer.colors.BRIGHT_BLUE, bold=True))
+    
+    # Generate backend deployment file
+    if deploy_type in ["backend", "both"]:
+        typer.echo("\nGenerating backend deployment file...")
+        try:
+            generate_backend_deploy(
+                repo=repo,
+                output_file=backend_config["output_file"],
+                project_id=project_id,
+                service_name=backend_config["service_name"],
+                region=region,
+                backend_dir=backend_config["backend_dir"],
+                python_version=backend_config["python_version"],
+                branches=branches,
+                check_secrets=check_secrets,
+                repomix_file=repomix_file
+            )
+        except typer.Abort:
+            typer.echo("Backend deployment file generation was aborted.")
+    
+    # Generate frontend deployment file
+    if deploy_type in ["frontend", "both"]:
+        typer.echo("\nGenerating frontend deployment file...")
+        try:
+            generate_frontend_deploy(
+                repo=repo,
+                output_file=frontend_config["output_file"],
+                project_id=project_id,
+                frontend_dir=frontend_config["frontend_dir"],
+                node_version=frontend_config["node_version"],
+                branches=branches,
+                check_secrets=check_secrets
+            )
+        except typer.Abort:
+            typer.echo("Frontend deployment file generation was aborted.")
+    
+    # Step 8: Summary
+    typer.echo("\n" + typer.style("Step 8: Summary", fg=typer.colors.BRIGHT_BLUE, bold=True))
+    typer.echo("Deployment file generation complete!")
+    
+    if deploy_type in ["backend", "both"]:
+        typer.echo(f"Backend deployment file: {backend_config['output_file']}")
+    
+    if deploy_type in ["frontend", "both"]:
+        typer.echo(f"Frontend deployment file: {frontend_config['output_file']}")
+    
+    typer.echo("\nNext steps:")
+    typer.echo("1. Review the generated deployment files")
+    typer.echo("2. Make sure all required secrets and variables are set in your GitHub repository")
+    typer.echo("3. Commit and push the deployment files to your repository")
+    typer.echo("4. GitHub Actions will automatically deploy your application when you push to the specified branches")
+    
+    typer.echo("\n" + typer.style("Thank you for using the Interactive Deployment Generator!", fg=typer.colors.BRIGHT_GREEN, bold=True))
+
+
 def main():
     """Main entry point for the application."""
     # Check if repomix is installed
     check_repomix_installed()
+    
+    # Check if no arguments were provided
+    if len(sys.argv) == 1:
+        typer.echo(typer.style("Welcome to deploy-gen!", fg=typer.colors.BRIGHT_GREEN, bold=True))
+        typer.echo("This tool helps you generate deployment files for your applications.")
+        typer.echo("\nTip: You can use our interactive mode for a guided experience:")
+        typer.echo(typer.style("  python main.py interactive-deploy", fg=typer.colors.BRIGHT_BLUE))
+        typer.echo("\nOr run with --help to see all available commands:")
+        typer.echo("  python main.py --help")
+        return
     
     # Run the Typer app
     app()
