@@ -276,3 +276,64 @@ You can disable these checks with the `--no-check-secrets` flag.
 
 **Required GitHub Variables:**
 - `FIREBASE_PROJECT_ID`: Your Firebase project ID
+
+#### Run Repomix Commands
+
+Execute repomix targeting a specific folder:
+
+```bash
+# Run repomix against the current directory
+python main.py run-repomix .
+
+# Run repomix against a specific folder
+python main.py run-repomix ./my-project
+```
+
+This command:
+1. Checks if the repomix npm package is installed globally
+2. Offers to install it if it's not found
+3. Executes `npx repomix /path/to/folder` with the target folder as an argument
+4. Streams the command output in real-time
+
+The command requires:
+- Node.js and npm to be installed
+- Internet connection (for npx to fetch repomix if needed)
+
+#### Generate Backend Deployment Workflow
+
+Generate a GitHub Actions workflow file for deploying a backend application to Google Cloud Run:
+
+```bash
+# Generate with default settings
+python main.py generate-backend-deploy owner/repo --project-id my-gcp-project
+
+# Customize the output
+python main.py generate-backend-deploy owner/repo --output .github/workflows/deploy-backend.yml --project-id my-project --service-name api-service --region us-central1 --python-version 3.11 --branches main,staging
+
+# Skip checking for secrets
+python main.py generate-backend-deploy owner/repo --project-id my-project --no-check-secrets
+```
+
+This command generates a GitHub Actions workflow file that:
+1. Triggers on pushes to specified branches
+2. Authenticates with Google Cloud
+3. Builds and pushes a Docker container to Google Artifact Registry
+4. Deploys the container to Cloud Run
+5. Sets up Python and runs tests
+
+By default, the command:
+- Checks if the required secrets exist in your GitHub repository and warns you if any are missing
+- Checks if the required variables exist in your GitHub repository
+- Uses the specified project ID and region in the workflow
+
+You can disable these checks with the `--no-check-secrets` flag.
+
+**Required GitHub Secrets:**
+- `CLOUDRUN_SERVICE_ACCOUNT`: Your Google Cloud service account credentials JSON
+- `FIREBASE_API_KEY`: Your Firebase API key
+- `POSTGRES_PASSWORD`: Your PostgreSQL database password
+
+**Required GitHub Variables:**
+- `CLOUD_SQL_CONNECTION_NAME`: Your Cloud SQL connection name
+- `POSTGRES_USER`: Your PostgreSQL database username
+- `POSTGRES_DB`: Your PostgreSQL database name

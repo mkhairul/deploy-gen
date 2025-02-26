@@ -13,7 +13,7 @@ import subprocess
 import sys
 import shutil
 
-app = typer.Typer(help="A simple CLI application using Typer")
+app = typer.Typer(help="Behold! The mighty deploy-gen! Let me generate deploy yaml files for you!")
 
 class OutputFormat(str, Enum):
     JSON = "json"
@@ -738,25 +738,612 @@ def generate_frontend_deploy(
     
     # Convert to YAML
     try:
-        import yaml
+        from ruamel.yaml import YAML
+        from ruamel.yaml.scalarstring import LiteralScalarString
     except ImportError:
-        typer.echo("PyYAML is required for this command. Installing...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "PyYAML"])
-        import yaml
+        typer.echo("ruamel.yaml is required for this command. Installing...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "ruamel.yaml"])
+        from ruamel.yaml import YAML
+        from ruamel.yaml.scalarstring import LiteralScalarString
     
     # Create output directory if it doesn't exist
     output_path = Path(output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
+    # Format multi-line strings as literal blocks
+    firebase_deploy_cmd = f"firebase use $PROJECT_ID && firebase deploy --only hosting"
+    workflow["jobs"]["deploy_frontend"]["steps"][6]["run"] = LiteralScalarString(firebase_deploy_cmd)
+    
+    # Configure YAML writer
+    yaml = YAML()
+    yaml.preserve_quotes = True
+    yaml.indent(mapping=2, sequence=4, offset=2)
+    yaml.width = 4096  # Set a very large line width to prevent line wrapping
+    
     # Write the workflow file
     with open(output_file, "w") as f:
-        yaml.dump(workflow, f, default_flow_style=False, sort_keys=False)
+        yaml.dump(workflow, f)
     
     typer.echo(f"Frontend deployment workflow generated at: {output_file}")
     typer.echo(f"Make sure you have the following secrets set in your GitHub repository:")
     typer.echo("  - FIREBASE_API_KEY: Your Firebase API key")
     typer.echo("  - FIREBASE_SERVICE_ACCOUNT: Your Firebase service account credentials JSON")
     typer.echo(f"Required: Set FIREBASE_PROJECT_ID as a repository variable to specify your Firebase project ID")
+
+
+@app.command()
+def generate_backend_deploy(
+    repo: str = typer.Argument(..., help="Repository name in format 'owner/repo'"),
+    output_file: str = typer.Option("deploy-backend.yml", "--output", "-o", help="Output file name"),
+    project_id: str = typer.Option(..., "--project-id", "-p", help="Google Cloud project ID"),
+    service_name: str = typer.Option("backend", "--service-name", "-s", help="Cloud Run service name"),
+    region: str = typer.Option("asia-southeast1", "--region", "-r", help="Google Cloud region"),
+    backend_dir: str = typer.Option("./", "--backend-dir", "-d", help="Path to backend directory"),
+    python_version: str = typer.Option("3.12", "--python-version", "-v", help="Python version to use"),
+    branches: str = typer.Option("main,dev", "--branches", "-b", help="Comma-separated list of branches to deploy from"),
+    check_secrets: bool = typer.Option(True, "--check-secrets/--no-check-secrets", help="Check if required secrets exist in the repository"),
+    repomix_file: str = typer.Option(None, "--repomix-file", help="Path to repomix output file to analyze for environment variables"),
+):
+    """
+    Generate a GitHub Actions workflow file for deploying a backend application to Google Cloud Run.
+    
+    This command creates a workflow file based on the structure found in deploy-sample.yml,
+    customized for deploying a Python backend application to Cloud Run.
+    
+    Examples:
+        - Generate with default settings:
+          python main.py generate-backend-deploy owner/repo --project-id my-gcp-project
+        
+        - Customize the output:
+          python main.py generate-backend-deploy owner/repo --output .github/workflows/deploy-backend.yml --project-id my-project --service-name api-service --region us-central1 --python-version 3.11 --branches main,staging
+        
+        - Skip checking for secrets:
+          python main.py generate-backend-deploy owner/repo --project-id my-project --no-check-secrets
+          
+        - Use repomix file to analyze environment variables:
+          python main.py generate-backend-deploy owner/repo --project-id my-project --repomix-file repomix-output.txt
+    """
+    # Initialize variables to store detected environment variables
+    detected_env_vars = set()
+    detected_secrets = set()
+    
+    # Check if repomix file is provided and exists
+    if repomix_file and os.path.exists(repomix_file):
+        typer.echo(f"Analyzing {repomix_file} for environment variables...")
+        try:
+            # Read the repomix file and extract environment variables
+            with open(repomix_file, 'r') as f:
+                content = f.read()
+                
+            # Use regex to find environment variables
+            import re
+            # Pattern to match os.environ.get("VARIABLE_NAME")
+            env_var_pattern = r'os\.environ\.get\("([A-Z_][A-Z0-9_]*)"\)'
+            env_vars = re.findall(env_var_pattern, content)
+            
+            if env_vars:
+                # Create categorization mappings for common variable types
+                db_password_patterns = ['PASSWORD', 'DB_PASS', 'DATABASE_PASS', 'DBPASS', 'DB_PASSWORD']
+                db_user_patterns = ['USER', 'DB_USER', 'DATABASE_USER', 'DBUSER', 'DB_USERNAME']
+                db_name_patterns = ['DB', 'DB_NAME', 'DATABASE', 'DATABASE_NAME', 'DBNAME']
+                db_connection_patterns = ['CONNECTION', 'CONN', 'DB_CONN', 'SQL_CONNECTION', 'DB_CONNECTION', 'CLOUD_SQL_CONNECTION_NAME']
+                api_key_patterns = ['API_KEY', 'APIKEY', 'KEY', 'SECRET_KEY', 'AUTH_KEY']
+                firebase_patterns = ['FIREBASE', 'FIREBASE_KEY', 'FIREBASE_SECRET']
+                
+                # Initialize variable categories
+                db_password_vars = []
+                db_user_vars = []
+                db_name_vars = []
+                db_connection_vars = []
+                api_key_vars = []
+                firebase_vars = []
+                other_vars = []
+                
+                # Categorize variables
+                unique_vars = sorted(set(env_vars))
+                typer.echo(f"Found {len(unique_vars)} environment variables in the codebase:")
+                
+                for var in unique_vars:
+                    typer.echo(f"  - {var}")
+                    
+                    # Check if variable matches any category
+                    var_upper = var.upper()
+                    
+                    # Database password variables
+                    if any(pattern in var_upper for pattern in db_password_patterns):
+                        db_password_vars.append(var)
+                        detected_secrets.add(var)
+                    
+                    # Database user variables
+                    elif any(pattern in var_upper for pattern in db_user_patterns):
+                        db_user_vars.append(var)
+                        detected_env_vars.add(var)
+                    
+                    # Database name variables
+                    elif any(pattern in var_upper for pattern in db_name_patterns):
+                        db_name_vars.append(var)
+                        detected_env_vars.add(var)
+                    
+                    # Database connection variables
+                    elif any(pattern in var_upper for pattern in db_connection_patterns):
+                        db_connection_vars.append(var)
+                        detected_env_vars.add(var)
+                    
+                    # API key variables
+                    elif any(pattern in var_upper for pattern in api_key_patterns):
+                        api_key_vars.append(var)
+                        detected_secrets.add(var)
+                    
+                    # Firebase variables
+                    elif any(pattern in var_upper for pattern in firebase_patterns):
+                        firebase_vars.append(var)
+                        detected_secrets.add(var)
+                    
+                    # Other variables that are likely secrets
+                    elif any(secret_word in var_upper for secret_word in ['SECRET', 'PASSWORD', 'PASS', 'KEY', 'TOKEN', 'PRIVATE']):
+                        detected_secrets.add(var)
+                        other_vars.append(var)
+                    
+                    # All other variables
+                    else:
+                        detected_env_vars.add(var)
+                        other_vars.append(var)
+                
+                # Store the categorized variables for later use
+                var_categories = {
+                    'db_password': db_password_vars[0] if db_password_vars else None,
+                    'db_user': db_user_vars[0] if db_user_vars else None,
+                    'db_name': db_name_vars[0] if db_name_vars else None,
+                    'db_connection': db_connection_vars[0] if db_connection_vars else None,
+                    'firebase_key': next((var for var in firebase_vars if 'KEY' in var.upper()), 
+                                        firebase_vars[0] if firebase_vars else None),
+                    'api_keys': api_key_vars,
+                    'other_secrets': [var for var in detected_secrets if var not in db_password_vars + firebase_vars + api_key_vars],
+                    'other_vars': [var for var in detected_env_vars if var not in db_user_vars + db_name_vars + db_connection_vars]
+                }
+                
+                # Print categorization summary
+                typer.echo("\nVariable categorization:")
+                if var_categories['db_password']:
+                    typer.echo(f"  Database password: {var_categories['db_password']}")
+                if var_categories['db_user']:
+                    typer.echo(f"  Database user: {var_categories['db_user']}")
+                if var_categories['db_name']:
+                    typer.echo(f"  Database name: {var_categories['db_name']}")
+                if var_categories['db_connection']:
+                    typer.echo(f"  Database connection: {var_categories['db_connection']}")
+                if var_categories['firebase_key']:
+                    typer.echo(f"  Firebase key: {var_categories['firebase_key']}")
+                if var_categories['api_keys']:
+                    typer.echo(f"  API keys: {', '.join(var_categories['api_keys'])}")
+                
+        except Exception as e:
+            typer.echo(f"Error analyzing repomix file: {e}")
+            typer.echo("Continuing with default environment variables...")
+            # Initialize empty categories if analysis failed
+            var_categories = {
+                'db_password': None,
+                'db_user': None,
+                'db_name': None,
+                'db_connection': None,
+                'firebase_key': None,
+                'api_keys': [],
+                'other_secrets': [],
+                'other_vars': []
+            }
+    else:
+        # Initialize empty categories if no repomix file
+        var_categories = {
+            'db_password': None,
+            'db_user': None,
+            'db_name': None,
+            'db_connection': None,
+            'firebase_key': None,
+            'api_keys': [],
+            'other_secrets': [],
+            'other_vars': []
+        }
+    
+    # Check if required secrets exist in the repository
+    if check_secrets:
+        typer.echo("Checking for required secrets and variables in the repository...")
+        
+        # Validate repository format
+        if "/" not in repo:
+            typer.echo("Error: Repository must be in format 'owner/repo'")
+            raise typer.Abort()
+        
+        # Get GitHub token
+        try:
+            token = get_github_token()
+            
+            # Create a StringIO object to capture the output of list_repo_secrets
+            import io
+            from contextlib import redirect_stdout
+            
+            # Check for required secrets
+            secrets_output = io.StringIO()
+            with redirect_stdout(secrets_output):
+                try:
+                    # Call list_repo_values directly to avoid the output formatting
+                    list_repo_values(repo, RepoValueType.SECRET)
+                except typer.Abort:
+                    typer.echo("Warning: Failed to get repository secrets.")
+                    typer.echo("Skipping secret verification.")
+                    check_secrets = False
+            
+            if check_secrets:
+                # Parse the output to get the secret names
+                secrets_data = secrets_output.getvalue()
+                
+                # Extract secret names from the output
+                import re
+                secret_names = []
+                for line in secrets_data.split('\n'):
+                    # Skip header and separator lines
+                    if line.startswith('Name') or line.startswith('-') or not line.strip():
+                        continue
+                    # Extract the secret name (first column)
+                    match = re.match(r'^(\S+)', line)
+                    if match:
+                        secret_names.append(match.group(1))
+                
+                # Determine required secrets based on detected environment variables
+                required_secrets = ["CLOUDRUN_SERVICE_ACCOUNT"]
+                if var_categories['db_password']:
+                    required_secrets.append(var_categories['db_password'])
+                if var_categories['firebase_key']:
+                    required_secrets.append(var_categories['firebase_key'])
+                for api_key in var_categories['api_keys']:
+                    required_secrets.append(api_key)
+                
+                missing_secrets = [secret for secret in required_secrets if secret not in secret_names]
+                
+                if missing_secrets:
+                    typer.echo(f"Warning: The following required secrets are missing from the repository: {', '.join(missing_secrets)}")
+                    typer.echo("The generated workflow will not work without these secrets.")
+                    
+                    # Ask if user wants to continue
+                    continue_anyway = typer.confirm("Do you want to continue generating the workflow file anyway?")
+                    if not continue_anyway:
+                        raise typer.Abort()
+                else:
+                    typer.echo("All required secrets are present in the repository.")
+                    
+                # Check for required variables
+                variables_output = io.StringIO()
+                with redirect_stdout(variables_output):
+                    try:
+                        # Call list_repo_values directly to avoid the output formatting
+                        list_repo_values(repo, RepoValueType.VARIABLE)
+                    except typer.Abort:
+                        typer.echo("Warning: Failed to get repository variables.")
+                
+                # Parse the output to get the variable names
+                variables_data = variables_output.getvalue()
+                
+                # Extract variable names from the output
+                variable_names = []
+                for line in variables_data.split('\n'):
+                    # Skip header and separator lines
+                    if line.startswith('Name') or line.startswith('-') or not line.strip():
+                        continue
+                    # Extract the variable name (first column)
+                    match = re.match(r'^(\S+)', line)
+                    if match:
+                        variable_names.append(match.group(1))
+                
+                # Determine required variables based on detected environment variables
+                required_variables = []
+                if var_categories['db_connection']:
+                    required_variables.append(var_categories['db_connection'])
+                if var_categories['db_user']:
+                    required_variables.append(var_categories['db_user'])
+                if var_categories['db_name']:
+                    required_variables.append(var_categories['db_name'])
+                
+                # If no variables were detected, use defaults
+                if not required_variables:
+                    required_variables = ["CLOUD_SQL_CONNECTION_NAME", "POSTGRES_USER", "POSTGRES_DB"]
+                
+                missing_variables = [var for var in required_variables if var not in variable_names]
+                
+                if missing_variables:
+                    typer.echo(f"Warning: The following required variables are missing from the repository: {', '.join(missing_variables)}")
+                    typer.echo("The generated workflow will not work correctly without these variables.")
+                    
+                    # Ask if user wants to continue
+                    continue_anyway = typer.confirm("Do you want to continue generating the workflow file anyway?")
+                    if not continue_anyway:
+                        raise typer.Abort()
+        
+        except typer.Abort:
+            typer.echo("Warning: GitHub token not found. Skipping secret verification.")
+            typer.echo("Please run 'github-auth' command to authenticate with GitHub.")
+            check_secrets = False
+    
+    # Parse branches
+    branch_list = [b.strip() for b in branches.split(",")]
+    
+    # Create the workflow content
+    workflow = {
+        "name": f"Deploy {service_name} to Cloud Run",
+        "on": {
+            "push": {
+                "branches": branch_list
+            }
+        },
+        "env": {
+            "PROJECT_ID": project_id,
+            "GAR_LOCATION": region,
+            "REPOSITORY": "cloud-run-source-deploy",
+            "SERVICE": service_name,
+            "REGION": region
+        },
+        "jobs": {
+            "build_and_deploy": {
+                "permissions": {
+                    "contents": "read",
+                    "id-token": "write"
+                },
+                "runs-on": "ubuntu-latest",
+                "steps": [
+                    {
+                        "uses": "actions/checkout@v4"
+                    },
+                    {
+                        "name": "Google Auth",
+                        "id": "auth",
+                        "uses": "google-github-actions/auth@v2",
+                        "with": {
+                            "credentials_json": "${{ secrets.CLOUDRUN_SERVICE_ACCOUNT }}",
+                            "token_format": "access_token"
+                        }
+                    },
+                    {
+                        "name": "Docker Auth",
+                        "id": "docker-auth",
+                        "uses": "docker/login-action@v1",
+                        "with": {
+                            "username": "oauth2accesstoken",
+                            "password": "${{ steps.auth.outputs.access_token }}",
+                            "registry": "${{ env.GAR_LOCATION }}-docker.pkg.dev"
+                        }
+                    },
+                    {
+                        "name": "Build and Push Container",
+                        "run": f"docker build -t \"${{{{ env.GAR_LOCATION }}}}-docker.pkg.dev/${{{{ env.PROJECT_ID }}}}/${{{{ env.REPOSITORY }}}}/${{{{ env.SERVICE }}}}:${{{{ github.sha }}}}\" {backend_dir}\ndocker push \"${{{{ env.GAR_LOCATION }}}}-docker.pkg.dev/${{{{ env.PROJECT_ID }}}}/${{{{ env.REPOSITORY }}}}/${{{{ env.SERVICE }}}}:${{{{ github.sha }}}}\""
+                    },
+                    {
+                        "name": "Deploy to Cloud Run",
+                        "id": "deploy",
+                        "uses": "google-github-actions/deploy-cloudrun@v2",
+                        "with": {
+                            "service": "${{ env.SERVICE }}",
+                            "region": "${{ env.REGION }}",
+                            "image": "${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE }}:${{ github.sha }}",
+                            "flags": f"--allow-unauthenticated{' --set-cloudsql-instances=${{ vars.' + var_categories['db_connection'] + ' }}' if var_categories['db_connection'] else ''}",
+                        }
+                    },
+                    {
+                        "name": "Installing Python",
+                        "uses": "actions/setup-python@v4",
+                        "with": {
+                            "python-version": python_version
+                        }
+                    },
+                    {
+                        "name": "Installing Python Dependencies",
+                        "run": f"pip install -r {backend_dir}/requirements.txt"
+                    },
+                    {
+                        "name": "Run Python Tests",
+                        "run": f"python -m pytest {backend_dir}/tests/"
+                    }
+                ]
+            }
+        }
+    }
+    
+    # Add Firebase API Key to env if detected
+    if var_categories['firebase_key']:
+        workflow["env"]["FIREBASE_API_KEY"] = f"${{{{ secrets.{var_categories['firebase_key']} }}}}"
+    
+    # Build environment variables string based on detected variables
+    env_vars_list = []
+    
+    # Add detected environment variables
+    if var_categories['db_user']:
+        env_vars_list.append(f"{var_categories['db_user']}='${{{{ vars.{var_categories['db_user']} }}}}'")
+    
+    if var_categories['db_password']:
+        env_vars_list.append(f"{var_categories['db_password']}='${{{{ secrets.{var_categories['db_password']} }}}}'")
+    
+    if var_categories['db_name']:
+        env_vars_list.append(f"{var_categories['db_name']}='${{{{ vars.{var_categories['db_name']} }}}}'")
+    
+    if var_categories['firebase_key']:
+        env_vars_list.append(f"{var_categories['firebase_key']}='${{{{ secrets.{var_categories['firebase_key']} }}}}'")
+    
+    if var_categories['db_connection']:
+        env_vars_list.append(f"{var_categories['db_connection']}='${{{{ vars.{var_categories['db_connection']} }}}}'")
+    
+    # Add API keys
+    for api_key in var_categories['api_keys']:
+        if api_key != var_categories['firebase_key']:  # Avoid duplication
+            env_vars_list.append(f"{api_key}='${{{{ secrets.{api_key} }}}}'")
+    
+    # Add other secrets
+    for secret in var_categories['other_secrets']:
+        env_vars_list.append(f"{secret}='${{{{ secrets.{secret} }}}}'")
+    
+    # Add other variables
+    for var in var_categories['other_vars']:
+        if var not in ["PORT", "POSTGRES_PORT"]:  # Skip common variables that don't need explanation
+            env_vars_list.append(f"{var}='${{{{ vars.{var} }}}}'")
+    
+    # Special case for PORT which is commonly needed
+    if "PORT" in detected_env_vars:
+        env_vars_list.append("PORT='8080'")
+    
+    # If no environment variables were detected, use defaults
+    if not env_vars_list:
+        env_vars_list = [
+            "POSTGRES_USER='${{ vars.POSTGRES_USER }}'",
+            "POSTGRES_PASSWORD='${{ secrets.POSTGRES_PASSWORD }}'",
+            "POSTGRES_DB='${{ vars.POSTGRES_DB }}'",
+            "FIREBASE_API_KEY='${{ secrets.FIREBASE_API_KEY }}'",
+            "CLOUD_SQL_CONNECTION_NAME='${{ vars.CLOUD_SQL_CONNECTION_NAME }}'"
+        ]
+    
+    # Join environment variables with newlines
+    env_vars_str = "\n".join(env_vars_list)
+    
+    # Add environment variables to the deploy step
+    workflow["jobs"]["build_and_deploy"]["steps"][4]["with"]["env_vars"] = env_vars_str
+    
+    # Convert to YAML
+    try:
+        from ruamel.yaml import YAML
+        from ruamel.yaml.scalarstring import LiteralScalarString
+    except ImportError:
+        typer.echo("ruamel.yaml is required for this command. Installing...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "ruamel.yaml"])
+        from ruamel.yaml import YAML
+        from ruamel.yaml.scalarstring import LiteralScalarString
+    
+    # Create output directory if it doesn't exist
+    output_path = Path(output_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Format multi-line strings as literal blocks
+    build_push_cmd = f"docker build -t \"${{{{ env.GAR_LOCATION }}}}-docker.pkg.dev/${{{{ env.PROJECT_ID }}}}/${{{{ env.REPOSITORY }}}}/${{{{ env.SERVICE }}}}:${{{{ github.sha }}}}\" {backend_dir}\ndocker push \"${{{{ env.GAR_LOCATION }}}}-docker.pkg.dev/${{{{ env.PROJECT_ID }}}}/${{{{ env.REPOSITORY }}}}/${{{{ env.SERVICE }}}}:${{{{ github.sha }}}}\""
+    
+    # Replace the strings with LiteralScalarString objects
+    workflow["jobs"]["build_and_deploy"]["steps"][3]["run"] = LiteralScalarString(build_push_cmd)
+    workflow["jobs"]["build_and_deploy"]["steps"][4]["with"]["env_vars"] = LiteralScalarString(env_vars_str)
+    
+    # Configure YAML writer
+    yaml = YAML()
+    yaml.preserve_quotes = True
+    yaml.indent(mapping=2, sequence=4, offset=2)
+    yaml.width = 4096  # Set a very large line width to prevent line wrapping
+    
+    # Write the workflow file
+    with open(output_file, "w") as f:
+        yaml.dump(workflow, f)
+    
+    typer.echo(f"Backend deployment workflow generated at: {output_file}")
+    typer.echo(f"Make sure you have the following secrets set in your GitHub repository:")
+    typer.echo("  - CLOUDRUN_SERVICE_ACCOUNT: Your Google Cloud service account credentials JSON")
+    
+    # Display detected secrets
+    if var_categories['db_password']:
+        typer.echo(f"  - {var_categories['db_password']}: Your database password")
+    
+    if var_categories['firebase_key']:
+        typer.echo(f"  - {var_categories['firebase_key']}: Your Firebase API key")
+    
+    for api_key in var_categories['api_keys']:
+        if api_key != var_categories['firebase_key']:  # Avoid duplication
+            typer.echo(f"  - {api_key}: Your API key")
+    
+    for secret in var_categories['other_secrets']:
+        typer.echo(f"  - {secret}: Your {secret.replace('_', ' ').title()}")
+    
+    typer.echo(f"\nMake sure you have the following variables set in your GitHub repository:")
+    
+    # Display detected variables
+    if var_categories['db_connection']:
+        typer.echo(f"  - {var_categories['db_connection']}: Your database connection string")
+    
+    if var_categories['db_user']:
+        typer.echo(f"  - {var_categories['db_user']}: Your database username")
+    
+    if var_categories['db_name']:
+        typer.echo(f"  - {var_categories['db_name']}: Your database name")
+    
+    for var in var_categories['other_vars']:
+        if var not in ["PORT", "POSTGRES_PORT"]:  # Skip common variables that don't need explanation
+            typer.echo(f"  - {var}: Your {var.replace('_', ' ').title()}")
+
+
+@app.command()
+def run_repomix(
+    target_folder: str = typer.Argument(..., help="Target folder to run repomix against"),
+):
+    """
+    Execute repomix targeting a specific folder.
+    
+    This command requires the repomix npm package to be installed globally.
+    If it's not installed, the command will offer to install it.
+    
+    Examples:
+        - Run repomix in the current directory:
+          python main.py run-repomix .
+        
+        - Run repomix in a specific folder:
+          python main.py run-repomix ./my-project
+    """
+    # Check if repomix is installed
+    if not check_repomix_installed():
+        typer.echo("Repomix is required for this command. Please install it and try again.")
+        raise typer.Abort()
+    
+    # Get the absolute path of the target folder
+    target_path = os.path.abspath(target_folder)
+    
+    # Check if the directory exists
+    if not os.path.isdir(target_path):
+        typer.echo(f"Error: Target folder '{target_folder}' does not exist or is not a directory.")
+        raise typer.Abort()
+    
+    # Prepare the command with the target path as an argument
+    cmd = ["npx", "repomix", target_path]
+    
+    typer.echo(f"Running repomix against {target_path}...")
+    
+    try:
+        # Execute the command
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            universal_newlines=True
+        )
+        
+        # Stream the output in real-time
+        for line in iter(process.stdout.readline, ""):
+            if not line:
+                break
+            typer.echo(line.strip())
+        
+        # Get the return code
+        return_code = process.wait()
+        
+        # Collect stderr
+        stderr_lines = []
+        for line in iter(process.stderr.readline, ""):
+            if not line:
+                break
+            stderr_lines.append(line.strip())
+        
+        # Check for errors
+        if return_code != 0:
+            typer.echo(f"Error executing repomix command (exit code {return_code}):")
+            for line in stderr_lines:
+                typer.echo(line)
+            raise typer.Abort()
+        
+        typer.echo(f"Repomix completed successfully.")
+        
+    except subprocess.CalledProcessError as e:
+        typer.echo(f"Error executing repomix command: {e}")
+        raise typer.Abort()
+    except Exception as e:
+        typer.echo(f"An unexpected error occurred: {e}")
+        raise typer.Abort()
 
 
 def main():
