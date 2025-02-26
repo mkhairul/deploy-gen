@@ -6,7 +6,9 @@ import requests
 import json
 from pathlib import Path
 import base64
-from nacl import encoding, public
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.serialization import load_pem_public_key
 import subprocess
 import sys
 import shutil
@@ -227,11 +229,37 @@ def list_repos(
         typer.echo(f"{name:<30} {stars:<7} {forks:<7} {updated:<20}")
 
 
-def encrypt_secret(public_key: str, secret_value: str) -> str:
-    """Encrypt a secret using the repository's public key."""
-    public_key = public.PublicKey(public_key.encode("utf-8"), encoding.Base64Encoder())
-    sealed_box = public.SealedBox(public_key)
-    encrypted = sealed_box.encrypt(secret_value.encode("utf-8"))
+def encrypt_secret(public_key_str: str, secret_value: str) -> str:
+    """
+    Encrypt a secret using the repository's public key with cryptography library.
+    
+    Args:
+        public_key_str: The public key as a base64 encoded string
+        secret_value: The secret value to encrypt
+    
+    Returns:
+        The encrypted value as a base64 encoded string
+    """
+    # Convert the base64 encoded public key to PEM format
+    public_key_bytes = base64.b64decode(public_key_str)
+    public_key_pem = b"-----BEGIN PUBLIC KEY-----\n"
+    public_key_pem += b"\n".join(base64.b64encode(public_key_bytes[i:i+32]) for i in range(0, len(public_key_bytes), 32))
+    public_key_pem += b"\n-----END PUBLIC KEY-----"
+    
+    # Load the public key
+    public_key = load_pem_public_key(public_key_pem)
+    
+    # Encrypt the secret value
+    encrypted = public_key.encrypt(
+        secret_value.encode("utf-8"),
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA1()),
+            algorithm=hashes.SHA1(),
+            label=None
+        )
+    )
+    
+    # Return the encrypted value as a base64 encoded string
     return base64.b64encode(encrypted).decode("utf-8")
 
 
@@ -503,6 +531,232 @@ def list_repo_values(
         typer.echo(f"\nFound {len(values)} {value_type.value}s for environment '{environment}' in repository '{repo}'")
     else:
         typer.echo(f"\nFound {len(values)} {value_type.value}s for repository '{repo}'")
+
+
+@app.command()
+def generate_frontend_deploy(
+    repo: str = typer.Argument(..., help="Repository name in format 'owner/repo'"),
+    output_file: str = typer.Option("deploy-frontend.yml", "--output", "-o", help="Output file name"),
+    project_id: str = typer.Option(..., "--project-id", "-p", help="Firebase project ID"),
+    frontend_dir: str = typer.Option("./frontend", "--frontend-dir", "-d", help="Path to frontend directory"),
+    node_version: str = typer.Option("18", "--node-version", "-n", help="Node.js version to use"),
+    branches: str = typer.Option("main,dev", "--branches", "-b", help="Comma-separated list of branches to deploy from"),
+    check_secrets: bool = typer.Option(True, "--check-secrets/--no-check-secrets", help="Check if required secrets exist in the repository"),
+):
+    """
+    Generate a GitHub Actions workflow file for deploying a frontend application to Firebase.
+    
+    This command uses deploy-sample.yml as a template and creates a new workflow file
+    specifically for deploying the frontend to Firebase Hosting.
+    
+    Examples:
+        - Generate with default settings:
+          python main.py generate-frontend-deploy owner/repo --project-id my-firebase-project
+        
+        - Customize the output:
+          python main.py generate-frontend-deploy owner/repo --output .github/workflows/deploy-frontend.yml --project-id my-project --frontend-dir ./client --node-version 16 --branches main,staging
+        
+        - Skip checking for secrets:
+          python main.py generate-frontend-deploy owner/repo --project-id my-project --no-check-secrets
+    """
+    # Check if required secrets exist in the repository
+    if check_secrets:
+        typer.echo("Checking for required secrets and variables in the repository...")
+        
+        # Validate repository format
+        if "/" not in repo:
+            typer.echo("Error: Repository must be in format 'owner/repo'")
+            raise typer.Abort()
+        
+        # Get GitHub token
+        try:
+            token = get_github_token()
+            
+            # Create a StringIO object to capture the output of list_repo_secrets
+            import io
+            from contextlib import redirect_stdout
+            
+            # Check for required secrets
+            secrets_output = io.StringIO()
+            with redirect_stdout(secrets_output):
+                try:
+                    # Call list_repo_values directly to avoid the output formatting
+                    list_repo_values(repo, RepoValueType.SECRET)
+                except typer.Abort:
+                    typer.echo("Warning: Failed to get repository secrets.")
+                    typer.echo("Skipping secret verification.")
+                    check_secrets = False
+            
+            if check_secrets:
+                # Parse the output to get the secret names
+                secrets_data = secrets_output.getvalue()
+                
+                # Extract secret names from the output
+                import re
+                secret_names = []
+                for line in secrets_data.split('\n'):
+                    # Skip header and separator lines
+                    if line.startswith('Name') or line.startswith('-') or not line.strip():
+                        continue
+                    # Extract the secret name (first column)
+                    match = re.match(r'^(\S+)', line)
+                    if match:
+                        secret_names.append(match.group(1))
+                
+                # Check for required secrets
+                required_secrets = ["FIREBASE_API_KEY", "FIREBASE_SERVICE_ACCOUNT"]
+                missing_secrets = [secret for secret in required_secrets if secret not in secret_names]
+                
+                if missing_secrets:
+                    typer.echo(f"Warning: The following required secrets are missing from the repository: {', '.join(missing_secrets)}")
+                    typer.echo("The generated workflow will not work without these secrets.")
+                    
+                    # Ask if user wants to continue
+                    continue_anyway = typer.confirm("Do you want to continue generating the workflow file anyway?")
+                    if not continue_anyway:
+                        raise typer.Abort()
+                else:
+                    typer.echo("All required secrets are present in the repository.")
+                    
+                # Check for required variables
+                variables_output = io.StringIO()
+                with redirect_stdout(variables_output):
+                    try:
+                        # Call list_repo_values directly to avoid the output formatting
+                        list_repo_values(repo, RepoValueType.VARIABLE)
+                    except typer.Abort:
+                        typer.echo("Warning: Failed to get repository variables.")
+                
+                # Parse the output to get the variable names
+                variables_data = variables_output.getvalue()
+                
+                # Extract variable names from the output
+                variable_names = []
+                for line in variables_data.split('\n'):
+                    # Skip header and separator lines
+                    if line.startswith('Name') or line.startswith('-') or not line.strip():
+                        continue
+                    # Extract the variable name (first column)
+                    match = re.match(r'^(\S+)', line)
+                    if match:
+                        variable_names.append(match.group(1))
+                
+                # Check for required variables
+                required_variables = ["FIREBASE_PROJECT_ID"]
+                missing_variables = [var for var in required_variables if var not in variable_names]
+                
+                if missing_variables:
+                    typer.echo(f"Warning: The following required variables are missing from the repository: {', '.join(missing_variables)}")
+                    typer.echo("The generated workflow will not work correctly without these variables.")
+                    
+                    # If FIREBASE_PROJECT_ID is missing, suggest setting it
+                    if "FIREBASE_PROJECT_ID" in missing_variables:
+                        set_project_var = typer.confirm(f"Would you like to set FIREBASE_PROJECT_ID to '{project_id}' now?")
+                        if set_project_var:
+                            try:
+                                # Call create_repo_value directly
+                                create_repo_value(repo, "FIREBASE_PROJECT_ID", project_id, RepoValueType.VARIABLE)
+                                typer.echo(f"Variable 'FIREBASE_PROJECT_ID' set to '{project_id}'")
+                            except typer.Abort:
+                                typer.echo("Failed to set FIREBASE_PROJECT_ID variable.")
+                                typer.echo("The workflow will be generated, but you must set this variable manually.")
+                        else:
+                            typer.echo("The workflow will be generated, but you must set FIREBASE_PROJECT_ID manually.")
+                            
+                            # Ask if user wants to continue
+                            continue_anyway = typer.confirm("Do you want to continue generating the workflow file anyway?")
+                            if not continue_anyway:
+                                raise typer.Abort()
+        
+        except typer.Abort:
+            typer.echo("Warning: GitHub token not found. Skipping secret verification.")
+            typer.echo("Please run 'github-auth' command to authenticate with GitHub.")
+            check_secrets = False
+    
+    # Parse branches
+    branch_list = [b.strip() for b in branches.split(",")]
+    
+    # Create the workflow content
+    workflow = {
+        "name": "Deploy Frontend to Firebase",
+        "on": {
+            "push": {
+                "branches": branch_list
+            }
+        },
+        "env": {
+            "FIREBASE_API_KEY": "${{ secrets.FIREBASE_API_KEY }}",
+            "PROJECT_ID": "${{ vars.FIREBASE_PROJECT_ID }}"
+        },
+        "jobs": {
+            "deploy_frontend": {
+                "permissions": {
+                    "contents": "read",
+                    "id-token": "write"
+                },
+                "runs-on": "ubuntu-latest",
+                "steps": [
+                    {
+                        "uses": "actions/checkout@v4"
+                    },
+                    {
+                        "name": "Setup Node.js",
+                        "uses": "actions/setup-node@v3",
+                        "with": {
+                            "node-version": node_version
+                        }
+                    },
+                    {
+                        "name": "Installing project dependencies",
+                        "working-directory": frontend_dir,
+                        "run": "npm install"
+                    },
+                    {
+                        "name": "Building the project",
+                        "working-directory": frontend_dir,
+                        "run": "npm run build"
+                    },
+                    {
+                        "name": "Install Firebase CLI",
+                        "run": "npm install -g firebase-tools"
+                    },
+                    {
+                        "name": "Authenticate with Google Cloud",
+                        "uses": "google-github-actions/auth@v1",
+                        "with": {
+                            "credentials_json": "${{ secrets.FIREBASE_SERVICE_ACCOUNT }}"
+                        }
+                    },
+                    {
+                        "name": "Deploy to Firebase",
+                        "run": f"firebase use $PROJECT_ID && firebase deploy --only hosting"
+                    }
+                ]
+            }
+        }
+    }
+    
+    # Convert to YAML
+    try:
+        import yaml
+    except ImportError:
+        typer.echo("PyYAML is required for this command. Installing...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "PyYAML"])
+        import yaml
+    
+    # Create output directory if it doesn't exist
+    output_path = Path(output_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Write the workflow file
+    with open(output_file, "w") as f:
+        yaml.dump(workflow, f, default_flow_style=False, sort_keys=False)
+    
+    typer.echo(f"Frontend deployment workflow generated at: {output_file}")
+    typer.echo(f"Make sure you have the following secrets set in your GitHub repository:")
+    typer.echo("  - FIREBASE_API_KEY: Your Firebase API key")
+    typer.echo("  - FIREBASE_SERVICE_ACCOUNT: Your Firebase service account credentials JSON")
+    typer.echo(f"Required: Set FIREBASE_PROJECT_ID as a repository variable to specify your Firebase project ID")
 
 
 def main():

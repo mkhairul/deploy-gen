@@ -17,6 +17,58 @@ This is a simple command-line application built with Typer.
    - Make sure Node.js and npm are installed
    - Install repomix globally: `npm install -g repomix`
 
+### Building a Standalone Binary
+
+You can build a standalone executable that includes all dependencies:
+
+#### Prerequisites
+
+1. Make sure you have activated your virtual environment:
+   - Windows: `.venv\Scripts\activate`
+   - Unix/MacOS: `source .venv/bin/activate`
+
+2. Ensure all dependencies are installed:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+#### Building the Binary
+
+##### Windows
+```bash
+# Run the build script
+build.bat
+```
+
+##### Unix/Linux/macOS
+```bash
+# Make the build script executable
+chmod +x build.sh
+
+# Run the build script
+./build.sh
+```
+
+The build process will create two types of executables:
+
+1. **Directory-based distribution** in `dist/deploy-gen/`:
+   - Contains the main executable and supporting files
+   - Recommended for local use
+   - More efficient as it loads libraries only when needed
+
+2. **Single-file executable** at `dist/deploy-gen-onefile`:
+   - Everything bundled into a single file
+   - Easier to distribute to others
+   - Slightly slower to start as it needs to extract files to a temporary location
+
+##### Notes on Building
+
+- The build scripts will check if you're in a virtual environment and use the Python interpreter from that environment
+- If no virtual environment is active, the scripts will warn you and ask if you want to continue
+- All Python dependencies will be included in the binary
+- Node.js and npm are still required separately if you need features that use the repomix package
+- If you encounter any issues with the build, check the error messages for guidance
+
 ### Dependencies
 
 The application has the following dependencies:
@@ -24,7 +76,8 @@ The application has the following dependencies:
 #### Python Dependencies
 - **typer**: For building the CLI interface
 - **requests**: For making HTTP requests to the GitHub API
-- **pynacl**: For encrypting secrets
+- **cryptography**: For encrypting secrets (compatible with Python 3.12+)
+- **pyyaml**: For generating YAML configuration files
 
 #### Node.js Dependencies
 - **repomix** (npm package): For additional repository management features
@@ -175,3 +228,51 @@ python main.py github-auth --help
 python main.py create-repo-secret --help
 python main.py create-repo-variable --help
 ```
+
+#### Generate Frontend Deployment Workflow
+
+Generate a GitHub Actions workflow file for deploying a frontend application to Firebase:
+
+```bash
+python main.py generate-frontend-deploy owner/repo --project-id my-firebase-project
+```
+
+With options:
+
+```bash
+# Customize the output file path
+python main.py generate-frontend-deploy owner/repo --output .github/workflows/deploy-frontend.yml --project-id my-project
+
+# Specify a different frontend directory
+python main.py generate-frontend-deploy owner/repo --project-id my-project --frontend-dir ./client
+
+# Set a specific Node.js version
+python main.py generate-frontend-deploy owner/repo --project-id my-project --node-version 16
+
+# Deploy from specific branches
+python main.py generate-frontend-deploy owner/repo --project-id my-project --branches main,staging,production
+
+# Skip checking for required secrets
+python main.py generate-frontend-deploy owner/repo --project-id my-project --no-check-secrets
+```
+
+This command generates a GitHub Actions workflow file that:
+1. Triggers on pushes to specified branches
+2. Sets up the specified Node.js version
+3. Installs dependencies and builds the frontend
+4. Deploys the built frontend to Firebase Hosting
+
+By default, the command:
+- Checks if the required secrets exist in your GitHub repository and warns you if any are missing
+- Checks if the required FIREBASE_PROJECT_ID variable exists
+- Offers to create the FIREBASE_PROJECT_ID variable if it doesn't exist
+- Uses the FIREBASE_PROJECT_ID variable in the workflow
+
+You can disable these checks with the `--no-check-secrets` flag.
+
+**Required GitHub Secrets:**
+- `FIREBASE_API_KEY`: Your Firebase API key
+- `FIREBASE_SERVICE_ACCOUNT`: Your Firebase service account credentials JSON
+
+**Required GitHub Variables:**
+- `FIREBASE_PROJECT_ID`: Your Firebase project ID
