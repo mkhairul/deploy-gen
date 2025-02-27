@@ -1411,6 +1411,11 @@ def interactive_deploy():
         type=click.Choice(["backend", "frontend", "both"]),
         default="backend"
     )
+
+    # Step 1b: Ask about Dockerfile generation for backend deployments
+    generate_docker = False
+    if deploy_type in ["backend", "both"]:
+        generate_docker = typer.confirm("Would you like to generate a Dockerfile for your backend?", default=True)
     
     # Step 2: Repository information
     typer.echo("\n" + typer.style("Step 2: Repository Information", fg=typer.colors.BRIGHT_BLUE, bold=True))
@@ -1580,12 +1585,30 @@ def interactive_deploy():
         except typer.Abort:
             typer.echo("Frontend deployment file generation was aborted.")
     
+    # Step 7b: Generate Dockerfile if requested
+    if generate_docker and deploy_type in ["backend", "both"]:
+        typer.echo("\nGenerating Dockerfile...")
+        try:
+            # Use the backend configuration values for Dockerfile generation
+            generate_dockerfile(
+                output_file=f"{backend_config['backend_dir']}/Dockerfile",
+                python_version=backend_config["python_version"],
+                backend_dir=backend_config["backend_dir"],
+                port=typer.prompt("Enter the port your application listens on", default=8000, type=int),
+                main_file=typer.prompt("Enter the main Python file to run", default="main.py"),
+                app_dir=typer.prompt("Enter the application directory in container", default="/app")
+            )
+        except typer.Abort:
+            typer.echo("Dockerfile generation was aborted.")
+    
     # Step 8: Summary
     typer.echo("\n" + typer.style("Step 8: Summary", fg=typer.colors.BRIGHT_BLUE, bold=True))
     typer.echo("Deployment file generation complete!")
     
     if deploy_type in ["backend", "both"]:
         typer.echo(f"Backend deployment file: {backend_config['output_file']}")
+        if generate_docker:
+            typer.echo(f"Dockerfile: {backend_config['backend_dir']}/Dockerfile")
     
     if deploy_type in ["frontend", "both"]:
         typer.echo(f"Frontend deployment file: {frontend_config['output_file']}")

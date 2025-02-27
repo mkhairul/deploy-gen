@@ -2,6 +2,7 @@
 echo Building deploy-gen binary...
 
 REM Build the binary using the spec file
+set PYTHON=python
 echo Building binary with PyInstaller...
 %PYTHON% -m PyInstaller deploy-gen.spec
 if %ERRORLEVEL% NEQ 0 (
