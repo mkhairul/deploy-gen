@@ -1599,6 +1599,65 @@ def interactive_deploy():
     typer.echo("\n" + typer.style("Thank you for using the Interactive Deployment Generator!", fg=typer.colors.BRIGHT_GREEN, bold=True))
 
 
+@app.command()
+def generate_firebase_config(
+    output_file: str = typer.Option("firebase.json", "--output", "-o", help="Output file name"),
+    public_dir: str = typer.Option("./frontend/dist", "--public-dir", "-p", help="Public directory for hosting"),
+    spa: bool = typer.Option(True, "--spa/--no-spa", help="Configure as Single Page Application (SPA)"),
+    ignore_files: list[str] = typer.Option(
+        ["firebase.json", "**/.*", "**/node_modules/**"],
+        "--ignore", "-i",
+        help="Files to ignore"
+    ),
+):
+    """
+    Generate a Firebase configuration file (firebase.json).
+    
+    This command creates a firebase.json file with hosting configuration
+    based on your project's needs.
+    
+    Examples:
+        - Generate with default settings:
+          python main.py generate-firebase-config
+        
+        - Customize the output:
+          python main.py generate-firebase-config --public-dir ./dist --no-spa
+        
+        - Add custom ignore patterns:
+          python main.py generate-firebase-config --ignore "*.log" --ignore "tmp/**"
+    """
+    # Create the configuration dictionary
+    config = {
+        "hosting": {
+            "public": public_dir,
+            "ignore": ignore_files
+        }
+    }
+    
+    # Add SPA configuration if requested
+    if spa:
+        config["hosting"]["rewrites"] = [{
+            "source": "**",
+            "destination": "/index.html"
+        }]
+    
+    # Create output directory if it doesn't exist
+    output_path = Path(output_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Write the configuration file with pretty formatting
+    with open(output_file, "w") as f:
+        json.dump(config, f, indent=2)
+    
+    typer.echo(f"Firebase configuration generated at: {output_file}")
+    typer.echo("\nNext steps:")
+    typer.echo("1. Review the generated firebase.json file")
+    typer.echo("2. Make sure Firebase CLI is installed ('npm install -g firebase-tools')")
+    typer.echo("3. Login to Firebase ('firebase login')")
+    typer.echo("4. Initialize your project ('firebase init')")
+    typer.echo("5. Deploy your application ('firebase deploy')")
+
+
 def main():
     """Main entry point for the application."""
     # Check if repomix is installed
@@ -1610,6 +1669,8 @@ def main():
         typer.echo("This tool helps you generate deployment files for your applications.")
         typer.echo("\nTip: You can use our interactive mode for a guided experience:")
         typer.echo(typer.style("  python main.py interactive-deploy", fg=typer.colors.BRIGHT_BLUE))
+        typer.echo("\nOr generate Firebase configuration:")
+        typer.echo(typer.style("  python main.py generate-firebase-config --help", fg=typer.colors.BRIGHT_BLUE))
         typer.echo("\nOr run with --help to see all available commands:")
         typer.echo("  python main.py --help")
         return
