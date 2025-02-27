@@ -16,7 +16,8 @@ OR if you're using the standalone binary:
 ./deploy-gen.exe interactive-deploy
 ```
 
-At the end of the process, you'll have a firebase.json, deploy-frontend.yml and deploy-backend.yml file in your project directory.
+At the end of the process, you'll have a firebase.json, Dockerfile, deploy-frontend.yml and deploy-backend.yml file in your project directory.
+
 
 #### Firebase.json
 
