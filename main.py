@@ -1600,6 +1600,69 @@ def interactive_deploy():
 
 
 @app.command()
+def generate_dockerfile(
+    output_file: str = typer.Option("Dockerfile", "--output", "-o", help="Output file name"),
+    python_version: str = typer.Option("3.12", "--python-version", "-p", help="Python version to use"),
+    backend_dir: str = typer.Option("backend", "--backend-dir", "-d", help="Path to backend directory"),
+    port: int = typer.Option(8000, "--port", help="Port to expose"),
+    main_file: str = typer.Option("main.py", "--main-file", "-m", help="Main Python file to run"),
+    app_dir: str = typer.Option("/app", "--app-dir", "-a", help="Application directory in container"),
+):
+    """
+    Generate a Dockerfile for a Python application.
+    
+    This command creates a Dockerfile based on best practices for Python applications,
+    configured for deployment to Cloud Run or similar container platforms.
+    
+    Examples:
+        - Generate with default settings:
+          python main.py generate-dockerfile
+        
+        - Customize the output:
+          python main.py generate-dockerfile --python-version 3.11 --port 5000 --main-file app.py
+        
+        - Specify different directories:
+          python main.py generate-dockerfile --backend-dir ./src --app-dir /usr/src/app
+    """
+    # Create the Dockerfile content
+    dockerfile_content = f"""FROM python:{python_version}
+ENV PYTHONUNBUFFERED True
+
+# Install Python dependencies
+COPY {backend_dir}/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+ENV APP_HOME /root
+WORKDIR $APP_HOME
+# Copy application code
+COPY {backend_dir}/ $APP_HOME/{backend_dir}
+
+# Expose the application port
+EXPOSE {port}
+WORKDIR $APP_HOME/{backend_dir}
+# Run the application
+CMD ["python", "{main_file}"]
+"""
+    
+    # Create output directory if it doesn't exist
+    output_path = Path(output_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Write the Dockerfile
+    with open(output_file, "w") as f:
+        f.write(dockerfile_content)
+    
+    typer.echo(f"Dockerfile generated at: {output_file}")
+    typer.echo("\nNext steps:")
+    typer.echo("1. Review the generated Dockerfile")
+    typer.echo("2. Make sure your requirements.txt file is up to date")
+    typer.echo("3. Build your Docker image:")
+    typer.echo(f"   docker build -t your-image-name .")
+    typer.echo("4. Test your Docker image locally:")
+    typer.echo(f"   docker run -p {port}:{port} your-image-name")
+
+
+@app.command()
 def generate_firebase_config(
     output_file: str = typer.Option("firebase.json", "--output", "-o", help="Output file name"),
     public_dir: str = typer.Option("./frontend/dist", "--public-dir", "-p", help="Public directory for hosting"),
