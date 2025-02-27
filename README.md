@@ -18,11 +18,16 @@ OR if you're using the standalone binary:
 
 At the end of the process, you'll have a firebase.json, Dockerfile, deploy-frontend.yml and deploy-backend.yml file in your project directory.
 
-
-#### Firebase.json
+#### firebase.json
 
 This file is used to configure the Firebase CLI. It tells the CLI where to find your Firebase project and how to deploy your frontend.
 It is to be located in the root of your project directory.
+
+#### Dockerfile
+
+This file is used to configure the Docker container for your backend.
+It is to be located in the root of your project directory.
+
 
 #### deploy-frontend.yml
 
